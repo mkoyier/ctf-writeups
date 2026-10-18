@@ -1,8 +1,6 @@
 # ctf-writeups
 # HackTheBox / Lab Writeup: Pickle Jar (Insecure Deserialization to Arbitrary File Read Privilege Escalation)
 
-Here is a humanized, engaging, and professional bug write-up for your GitHub repository. It walks through the complete kill chain from initial RCE via insecure Python `pickle` deserialization to exploiting a `sudo` misconfiguration for full root flag retrieval.
-
 ---
 
 # Lab Writeup: Pickle Jar
